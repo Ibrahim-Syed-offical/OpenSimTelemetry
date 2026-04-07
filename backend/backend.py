@@ -10,7 +10,7 @@ from pathlib import Path
 import uuid
 import numpy as np
 import h5py
-
+from fastapi import FastAPI
 
 accSpath = "Local\\acpmf_static"
 accPpath = "Local\\acpmf_physics"
@@ -110,6 +110,31 @@ fields_Physics = [
     *[f"tch_{w}_{a}" for w in ("fl","fr","rl","rr") for a in "xyz"],
     "brakeBias","lvel_x","lvel_y","lvel_z",
 ]
+
+app = FastAPI()
+
+class API:
+    
+    def __init__ (self):
+        backend = Backend()
+    
+    @app.get("/laps")
+    def get_track(self):
+        backend.db.execute("SELECT * FROM laps ORDER BY date_time DESC")
+        rows = backend.db.fetchmany(10)
+        return [{"uuid":r[0],"lap_time":r[1],"car":r[2],"track":r[3],"tel_path":r[4],"date_time":r[5],"favorite":bool(r[6]) }, 
+        for r in rows]
+    
+    @app.get("/laps/{uuid}/gas_tel")
+    def get_gas(uuid: str):
+        backend.db.execute("SELECT tel_path FROM laps WHERE UUID = ?", (uuid,))
+        row = backend.db.fetchone()
+        if not row:
+            raise
+        gas_path = Path(row[0])
+        gas_path = gas_path / "gas"
+        print(gas_path)q
+
 
 class Backend:
     physics_struct = struct.Struct(fmt_Physics)
@@ -234,13 +259,13 @@ class HandleTraces:
         write("brake", self.y_brake)
         write("steering", self.y_steering)
 
-        backend = Backend()
-        backend.db.execute('''
+        
+        self.backend.db.execute('''
             INSERT INTO laps (UUID, lap_time, car, track, tel_path, date_time)
             VALUES (?, ?, ?, ?, ?, ?)''',
             (str(uuid.uuid4()), str(self.x_time[-1]), self.backend.get_car(), self.backend.get_track(),
              str(setup.set_laps_dir("default")), datetime.datetime.now().strftime('%Y-%m-%d_%H-%M')))
-        backend.conn.commit()
+        self.backend.conn.commit()
 
 def main():
     backend = Backend()
