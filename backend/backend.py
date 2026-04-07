@@ -116,24 +116,43 @@ app = FastAPI()
 class API:
     
     def __init__ (self):
-        backend = Backend()
+        self.backend = Backend()
     
     @app.get("/laps")
     def get_track(self):
-        backend.db.execute("SELECT * FROM laps ORDER BY date_time DESC")
-        rows = backend.db.fetchmany(10)
-        return [{"uuid":r[0],"lap_time":r[1],"car":r[2],"track":r[3],"tel_path":r[4],"date_time":r[5],"favorite":bool(r[6]) }, 
-        for r in rows]
+        self.backend.db.execute("SELECT * FROM laps ORDER BY date_time DESC")
+        rows = self.backend.db.fetchmany(10)
+        return [{"uuid":r[0],"lap_time":r[1],"car":r[2],"track":r[3],"tel_path":r[4],"date_time":r[5],"favorite":bool(r[6])} for r in rows]
     
     @app.get("/laps/{uuid}/gas_tel")
-    def get_gas(uuid: str):
-        backend.db.execute("SELECT tel_path FROM laps WHERE UUID = ?", (uuid,))
-        row = backend.db.fetchone()
+    def get_gas(self, uuid: str):
+        self.backend.db.execute("SELECT tel_path FROM laps WHERE UUID = ?", (uuid,))
+        row = self.backend.db.fetchone()
         if not row:
             raise
         gas_path = Path(row[0])
         gas_path = gas_path / "gas"
-        print(gas_path)q
+        print(gas_path)
+
+    @app.get("/laps/{uuid}/brake_tel")
+    def get_brake(self):
+        self.backend.db.execute("SELECT tel_path FROM laps WHERE UUID = ?", (uuid,))
+        row = self.backend.db.fetchone()
+        if not row:
+            raise
+        brake_path = Path(row[0])
+        brake_path = brake_path / "brake"
+        print(brake_path)
+
+    @app.get("/laps/{uuid}/steer_tel")
+    def get_steer(self):
+        self.backend.db.execute("SELECT tel_path FROM laps WHERE UUID = ?", (uuid,))
+        row = self.backend.db.fetchone()
+        if not row:
+            raise
+        steer_path = Path(row[0])
+        steer_path = steer_path / "steering"
+        print(steer_path)
 
 
 class Backend:

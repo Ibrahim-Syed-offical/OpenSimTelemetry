@@ -1,2 +1,0 @@
-import backend
-backend.main()
