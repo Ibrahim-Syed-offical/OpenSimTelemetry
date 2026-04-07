@@ -1,12 +1,58 @@
+import mmap
+import struct
 import sys
 import random
 from PyQt6 import QtWidgets, QtCore
 import pyqtgraph as pg
-import backend.backend as backend
 from collections import deque
 HISTORY = 400
 
+accPpath = "Local\\acpmf_physics"
+
+
+fmt_Physics = '<i' + 'f' * 3 + 'ii' + 'f' * 2 + '3f3f' + '4f4f4f4f4f4f4f4f4f' + \
+      'fffff' + '5f' + 'iif' + 'fff' + 'if' + '2f' + 'fffff' + '3f' + \
+      'ff' + 'iiiii' + 'f' + 'ii' + '4ff' + '4f4f4f' + 'i' + '12f12f12f' + 'f3f'
+
+
+fields_Physics = [
+    "packetId","gas","brake","fuel","gear","rpms","steerAngle","speedKmh",
+    "vel_x","vel_y","vel_z","accG_x","accG_y","accG_z",
+    "slip_fl","slip_fr","slip_rl","slip_rr",
+    "load_fl","load_fr","load_rl","load_rr",
+    "psi_fl","psi_fr","psi_rl","psi_rr",
+    "wspd_fl","wspd_fr","wspd_rl","wspd_rr",
+    "wear_fl","wear_fr","wear_rl","wear_rr",
+    "dirt_fl","dirt_fr","dirt_rl","dirt_rr",
+    "tcoreT_fl","tcoreT_fr","tcoreT_rl","tcoreT_rr",
+    "camber_fl","camber_fr","camber_rl","camber_rr",
+    "susp_fl","susp_fr","susp_rl","susp_rr",
+    "drs","tc","heading","pitch","roll","cgHeight",
+    "dmg_f","dmg_r","dmg_l","dmg_ri","dmg_c",
+    "tyresOut","pitLimiter","abs",
+    "kersCharge","kersInput","autoShifter",
+    "rideH_f","rideH_r",
+    "turbo","ballast","airDensity","airTemp","roadTemp",
+    "angVel_x","angVel_y","angVel_z",
+    "finalFF","perfMeter",
+    "engineBrake","ersRecovery","ersPower","ersHeatCharge","ersCharging",
+    "kersKJ","drsAvail","drsEnabled",
+    "brakeT_fl","brakeT_fr","brakeT_rl","brakeT_rr","clutch",
+    "tTempI_fl","tTempI_fr","tTempI_rl","tTempI_rr",
+    "tTempM_fl","tTempM_fr","tTempM_rl","tTempM_rr",
+    "tTempO_fl","tTempO_fr","tTempO_rl","tTempO_rr",
+    "isAI",
+    *[f"tcp_{w}_{a}" for w in ("fl","fr","rl","rr") for a in "xyz"],
+    *[f"tcn_{w}_{a}" for w in ("fl","fr","rl","rr") for a in "xyz"],
+    *[f"tch_{w}_{a}" for w in ("fl","fr","rl","rr") for a in "xyz"],
+    "brakeBias","lvel_x","lvel_y","lvel_z",
+]
+
+
+physics_struct = struct.Struct(fmt_Physics)
+
 class Overlay(QtWidgets.QMainWindow):
+    physics_struct = struct.Struct(fmt_Physics)
     def __init__(self):
         super().__init__()
 
@@ -54,6 +100,8 @@ class Overlay(QtWidgets.QMainWindow):
         self.graph.showGrid(x=True, y=True, alpha=0.3)
         self.graph.getViewBox().installEventFilter(self)
         self.graph.viewport().installEventFilter(self)
+        self.phys_map = mmap.mmap(-1, 584, accPpath, access=mmap.ACCESS_READ)
+       
 
     def eventFilter(self, obj, event):
         watched = {self.graph.getViewBox(), self.graph.viewport()}
@@ -72,9 +120,12 @@ class Overlay(QtWidgets.QMainWindow):
                 return True
         return super().eventFilter(obj, event)
    
+    def get_traces(self):
+        vals = self.physics_struct.unpack(self.phys_map)
+        return vals[1], vals[2], vals[6]
 
     def update_graph(self):
-        traces = backend.get_traces()
+        traces = self.get_traces()
         self.y.append(traces[0])
         self.curve.setData(self.x, list(self.y))
 

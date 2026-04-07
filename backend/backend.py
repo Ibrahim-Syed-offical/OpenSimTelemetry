@@ -1,4 +1,5 @@
 
+import atexit
 import datetime
 import mmap
 import os
@@ -6,12 +7,11 @@ import struct
 import time
 import sqlite3
 from pathlib import Path
+import uuid
 import numpy as np
 import h5py
 
-conn = sqlite3.connect('data.db')
 
-db = conn.cursor()
 accSpath = "Local\\acpmf_static"
 accPpath = "Local\\acpmf_physics"
 accGpath = "Local\\acpmf_graphics"
@@ -60,7 +60,7 @@ fields_Graphics = [
     "rainIntensityIn30min", "currentTyreSet", "strategyTyreSet", "gapAhead", "gapBehind"
 ]
 
-fields_static = [
+fields_Static = [
     "smVersion", "acVersion",
     "numberOfSessions", "numCars",
     "carModel", "track", "playerName", "playerSurname", "playerNick",
@@ -116,62 +116,135 @@ class Backend:
     static_struct = struct.Struct(fmt_static)
     graphic_struct = struct.Struct(fmt_Graphics)
 
-    @staticmethod
-    def get_shm(path, byte_size, field_type, struct_obj):
-        with mmap.mmap(-1, byte_size, path, access=mmap.ACCESS_READ) as shm:
-            vals = struct_obj.unpack(shm)
-        return dict(zip(field_type, vals))
+
+    def __init__(self):
+        self.phys_map = mmap.mmap(-1, 584, accPpath, access=mmap.ACCESS_READ)
+        self.graph_map = mmap.mmap(-1, 1542, accGpath, access=mmap.ACCESS_READ)
+        self.static_map = mmap.mmap(-1, 820, accSpath, access=mmap.ACCESS_READ)
+        try:
+            self.conn = sqlite3.connect('database.db')
+            self.db = self.conn.cursor()
+        except Exception as e:
+            print(f"Error connecting to database: {e}")
+            raise
+        self.db_init()
+        atexit.register(self.exit)
+
+    def db_init(self):
+        try:
+            self.db.execute('''
+                CREATE TABLE IF NOT EXISTS laps (
+                    UUID TEXT PRIMARY KEY,
+                    lap_time TEXT,
+                    car TEXT,
+                    track TEXT,
+                    tel_path TEXT,
+                    date_time TEXT,
+                    favorite INTEGER DEFAULT 0
+                )
+            ''')
+            self.conn.commit()
+        except Exception as e:
+            print(f"Error initializing database: {e}")
+            raise
+
+    def exit(self):
+        self.phys_map.close()
+        self.graph_map.close()
+        self.conn.commit()
+        self.conn.close()
+        
+    def get_traces(self):
+        vals = self.physics_struct.unpack(self.phys_map)
+        return vals[1], vals[2], vals[6]
+
+    def get_laps(self):
+        vals = self.graphic_struct.unpack(self.graph_map)
+        return vals[fields_Graphics.index("completedLaps")]
     
-    @staticmethod
-    def get_traces():
-        unpack = Backend.get_shm(accPpath, 584, fields_Physics, Backend.physics_struct)
-        gas = unpack["gas"]
-        brake = unpack["brake"]
-        steering = unpack["steerAngle"]
-        return [gas,brake,steering]
     
-    @staticmethod
-    def get_track():
-        unpack = Backend.get_shm(accSpath, 1168, fields_static, Backend.static_struct)
-        track_name = unpack["track"]
+    def get_track(self):     
+        vals = self.static_struct.unpack(self.static_map)
+        track_name = vals[fields_Static.index("track")]
         return track_name.decode('utf-16-le').rstrip('\x00')
     
-    @staticmethod
-    def get_laps():
-        unpack = Backend.get_shm(accGpath, 1542, fields_Graphics, Backend.graphic_struct)
-        lap = unpack["completedLaps"]
-        return lap
-    
-    @staticmethod
-    def get_car():
-        unpack = Backend.get_shm(accSpath, 1168, fields_static, Backend.static_struct)
-        car_name = unpack["carModel"]
+   
+    def get_car(self):
+        vals = self.static_struct.unpack(self.static_map)
+        car_name = vals[fields_Static.index("carModel")]
         return car_name.decode('utf-16-le').rstrip('\x00')
 
-
 class setup:
-    def set_laps_dir():
+    def set_laps_dir(type: str):
         if os.name == 'nt':
             base_path = Path(os.environ.get('LOCALAPPDATA'))
-        lap_dir = base_path / "opentelemetry" / "laps"
+        if type == "default":
+            return base_path / "OpenSimTelemetry" / "laps"
+        lap_dir = base_path / "opentelemetry" / "laps" / type
         lap_dir.mkdir(parents=True, exist_ok=True)
         return lap_dir
 
-class handle_traces:
-    def __init__(self):
-        self.interval = 0.01
+class HandleTraces:
+    def __init__(self, backend, hz=100):
+        self.backend = backend
 
-    def dump_throttle(interval=0.01):
-            y_value = []
-            x_value = []
-            current_lap = Backend.get_laps()
-            current_time = time.perf_counter()
-            start_time = current_time
-            while True:
-                y_value.append(Backend.get_traces()[0])    
-                x_value.append(round(current_time - start_time, 3))
-                current_time += interval
-                if (Backend.get_laps() - current_lap) > 0:
-                    with h5py.File(setup.set_laps_dir() / f"lap_{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.h5", "w") as f:
-                        f.create_dataset("throttle", data=np.array(y_value))
-                        f.create_dataset("time", data=np.array(x_value))
+        self.interval = 1.0 / hz   # 100Hz = 0.01, 200Hz = 0.005
+        self.start_time = time.perf_counter()
+
+        self.x_time = []
+        self.y_gas = []
+        self.y_brake = []
+        self.y_steering = []
+
+        self.last_lap = backend.get_laps()
+
+    def loop(self):
+        next_tick = time.perf_counter()
+
+        while True:
+            gas, brake, steering = self.backend.get_traces()
+
+            now = time.perf_counter()
+
+            self.y_gas.append(gas)
+            self.y_brake.append(brake)
+            self.y_steering.append(steering)
+            self.x_time.append(now - self.start_time)
+
+            current_lap = self.backend.get_laps()
+            if current_lap > self.last_lap:
+                self.last_lap = current_lap
+                self.save()
+            
+            next_tick += self.interval
+            sleep_time = next_tick - time.perf_counter()
+
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
+    def save(self):
+        timestamp = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M')
+
+        def write(name, data):
+            with h5py.File(setup.set_laps_dir(name) / f"lap_{timestamp}.h5", "w") as f:
+                f.create_dataset(name, data=np.array(data, dtype=np.float32))
+                f.create_dataset("time", data=np.array(self.x_time, dtype=np.float32))
+
+        write("gas", self.y_gas)
+        write("brake", self.y_brake)
+        write("steering", self.y_steering)
+
+        backend = Backend()
+        backend.db.execute('''
+            INSERT INTO laps (UUID, lap_time, car, track, tel_path, date_time)
+            VALUES (?, ?, ?, ?, ?, ?)''',
+            (str(uuid.uuid4()), str(self.x_time[-1]), self.backend.get_car(), self.backend.get_track(),
+             str(setup.set_laps_dir("default")), datetime.datetime.now().strftime('%Y-%m-%d_%H-%M')))
+        backend.conn.commit()
+
+def main():
+    backend = Backend()
+    handler = HandleTraces(backend, hz=100)
+    handler.loop()
+
+main()

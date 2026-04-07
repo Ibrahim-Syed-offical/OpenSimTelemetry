@@ -19,8 +19,7 @@ def dump_throttle(interval=0.01):
                 current_time += interval
                 if (Backend.get_laps() - current_lap) > 0:
                     with h5py.File(setup.set_laps_dir() / f"lap_{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M')}.h5", "w") as f:
-                        f.create_dataset("throttle", data=np.array(y_value, dtype=np.float32))
-                        f.create_dataset("time", data=np.array(x_value, dtype=np.float32))
+                        f.create_dataset("throttle", data=np.array(y_value, dtype=np.float32), compression="gzip", compression_opts=4)
+                        f.create_dataset("time", data=np.array(x_value, dtype=np.float32), compression="gzip", compression_opts=4)
                         break
 
-dump_throttle()
