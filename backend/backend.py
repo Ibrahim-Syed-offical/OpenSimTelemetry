@@ -1,16 +1,19 @@
-
 import atexit
 import datetime
 import mmap
 import os
 import struct
-import time
 import sqlite3
 from pathlib import Path
 import uuid
 import numpy as np
 import h5py
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
+import threading
+from contextlib import asynccontextmanager
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
+from pydantic import BaseModel
 
 accSpath = "Local\\acpmf_static"
 accPpath = "Local\\acpmf_physics"
@@ -25,14 +28,50 @@ fmt_Physics = '<i' + 'f' * 3 + 'ii' + 'f' * 2 + '3f3f' + '4f4f4f4f4f4f4f4f4f' + 
       'fffff' + '5f' + 'iif' + 'fff' + 'if' + '2f' + 'fffff' + '3f' + \
       'ff' + 'iiiii' + 'f' + 'ii' + '4ff' + '4f4f4f' + 'i' + '12f12f12f' + 'f3f'
 
-fmt_Graphics = '<' + \
-    'i' + 'i' + 'i' + \
-    '30s' * 4 + \
-    'i' + 'i' + 'iii' + 'f' + 'f' + 'i' + 'i' + 'i' + 'i' + \
-    '66s' + 'f' + 'f' + 'i' + \
-    'f' * 180 + 'i' * 60 + 'i' + 'f' + 'i' + 'i' + 'i' + 'i' + 'f' + 'i' + 'f' + 'f' + 'i' + \
-    'ii' + 'iiiii' + 'f' + 'ii' + 'i' + 'f' + 'ii' + '66s' * 2 + 'i' * 10 + 'f' * 4 + \
-    'iiiii' + 'i' + 'i' + 'iii'
+fmt_Graphics = (
+    '<'
+    'i i i'
+    '30s 30s 30s 30s'
+    'i i i i i'
+    'f f'
+    'i i i i i'
+    '66s'
+    'f f'
+    'i'
+    + 'f' * (60 * 3)
+    + 'i' * 60 +
+    'i'
+    'f'
+    'i i'
+    'i i'
+    'f'
+    'i'
+    'f f'
+    'i i i'
+    'i i i i'
+    'f'
+    'i i i'
+    'f'
+    'i'
+    'i i'
+    'i i'
+    'f'
+    '30s'
+    'i'
+    '30s'
+    'i'
+    'i i i'
+    'f'
+    '66s'
+    'i'
+    'f'
+    'i i'
+    'i i i i i i i i i i'
+    'i f f f f f'
+    'i i i i'
+    'i i'
+    'i i'
+)
 
 fields_Graphics = [
     "packetId", "status", "session",
@@ -111,48 +150,28 @@ fields_Physics = [
     "brakeBias","lvel_x","lvel_y","lvel_z",
 ]
 
-app = FastAPI()
 
-class API:
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    backend = Backend()
+    handler = HandleTraces(backend, hz=100)
     
-    def __init__ (self):
-        self.backend = Backend()
-    
-    @app.get("/laps")
-    def get_track(self):
-        self.backend.db.execute("SELECT * FROM laps ORDER BY date_time DESC")
-        rows = self.backend.db.fetchmany(10)
-        return [{"uuid":r[0],"lap_time":r[1],"car":r[2],"track":r[3],"tel_path":r[4],"date_time":r[5],"favorite":bool(r[6])} for r in rows]
-    
-    @app.get("/laps/{uuid}/gas_tel")
-    def get_gas(self, uuid: str):
-        self.backend.db.execute("SELECT tel_path FROM laps WHERE UUID = ?", (uuid,))
-        row = self.backend.db.fetchone()
-        if not row:
-            raise
-        gas_path = Path(row[0])
-        gas_path = gas_path / "gas"
-        print(gas_path)
 
-    @app.get("/laps/{uuid}/brake_tel")
-    def get_brake(self):
-        self.backend.db.execute("SELECT tel_path FROM laps WHERE UUID = ?", (uuid,))
-        row = self.backend.db.fetchone()
-        if not row:
-            raise
-        brake_path = Path(row[0])
-        brake_path = brake_path / "brake"
-        print(brake_path)
+    telemetry_thread = threading.Thread(target=handler.loop, daemon=True)
+    telemetry_thread.start()
+    
+    yield 
 
-    @app.get("/laps/{uuid}/steer_tel")
-    def get_steer(self):
-        self.backend.db.execute("SELECT tel_path FROM laps WHERE UUID = ?", (uuid,))
-        row = self.backend.db.fetchone()
-        if not row:
-            raise
-        steer_path = Path(row[0])
-        steer_path = steer_path / "steering"
-        print(steer_path)
+
+app = FastAPI(lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 
 class Backend:
@@ -163,10 +182,10 @@ class Backend:
 
     def __init__(self):
         self.phys_map = mmap.mmap(-1, 584, accPpath, access=mmap.ACCESS_READ)
-        self.graph_map = mmap.mmap(-1, 1542, accGpath, access=mmap.ACCESS_READ)
+        self.graph_map = mmap.mmap(-1, struct.calcsize(fmt_Graphics), accGpath, access=mmap.ACCESS_READ)
         self.static_map = mmap.mmap(-1, 820, accSpath, access=mmap.ACCESS_READ)
         try:
-            self.conn = sqlite3.connect('database.db')
+            self.conn = sqlite3.connect('database.db', check_same_thread=False)
             self.db = self.conn.cursor()
         except Exception as e:
             print(f"Error connecting to database: {e}")
@@ -201,10 +220,21 @@ class Backend:
     def get_traces(self):
         vals = self.physics_struct.unpack(self.phys_map)
         return vals[1], vals[2], vals[6]
-
+    
+    def get_distance(self):
+        vals = self.graphic_struct.unpack(self.graph_map)
+        
+        return vals[fields_Graphics.index("normalizedCarPosition")]
+    
     def get_laps(self):
         vals = self.graphic_struct.unpack(self.graph_map)
-        return vals[fields_Graphics.index("completedLaps")]
+        laps = vals[fields_Graphics.index("completedLaps")]
+        
+        
+        last_time_bytes = vals[fields_Graphics.index("lastTime")]
+        formatted_time = last_time_bytes.decode('utf-16-le').rstrip('\x00')
+        
+        return laps, formatted_time
     
     
     def get_track(self):     
@@ -219,70 +249,102 @@ class Backend:
         return car_name.decode('utf-16-le').rstrip('\x00')
 
 class setup:
-    def set_laps_dir(type: str):
+    @staticmethod
+    def set_laps_dir(folder_type: str):
+    
         if os.name == 'nt':
-            base_path = Path(os.environ.get('LOCALAPPDATA'))
-        if type == "default":
-            return base_path / "OpenSimTelemetry" / "laps"
-        lap_dir = base_path / "opentelemetry" / "laps" / type
+            base_path = Path(os.environ.get('LOCALAPPDATA', ''))
+        else:
+            base_path = Path.cwd() 
+            
+        
+        if folder_type == "default":
+            lap_dir = base_path / "OpenSimTelemetry" / "laps"
+        else:
+            lap_dir = base_path / "OpenSimTelemetry" / "laps" / folder_type
+            
         lap_dir.mkdir(parents=True, exist_ok=True)
         return lap_dir
 
+
 class HandleTraces:
-    def __init__(self, backend, hz=100):
+    def __init__(self, backend, hz=70):
         self.backend = backend
-
-        self.interval = 1.0 / hz   # 100Hz = 0.01, 200Hz = 0.005
-        self.start_time = time.perf_counter()
-
-        self.x_time = []
+        self.interval = 1.0 / hz   
+       
+        self.x_dist = []
         self.y_gas = []
         self.y_brake = []
         self.y_steering = []
+        self.samples = []
 
-        self.last_lap = backend.get_laps()
+
+        self.last_lap, _ = backend.get_laps()
 
     def loop(self):
-        next_tick = time.perf_counter()
-
+        print("Telemetry loop started.")
         while True:
-            gas, brake, steering = self.backend.get_traces()
-
-            now = time.perf_counter()
-
-            self.y_gas.append(gas)
-            self.y_brake.append(brake)
-            self.y_steering.append(steering)
-            self.x_time.append(now - self.start_time)
-
-            current_lap = self.backend.get_laps()
-            if current_lap > self.last_lap:
-                self.last_lap = current_lap
-                self.save()
             
-            next_tick += self.interval
-            sleep_time = next_tick - time.perf_counter()
 
-            if sleep_time > 0:
-                time.sleep(sleep_time)
+            gas, brake, steering = self.backend.get_traces()
+            x = self.backend.get_distance()
+            
 
-    def save(self):
-        timestamp = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M')
+            self.samples.append({
+            "gas": gas,
+            "brake": brake,
+            "steering": steering,
+            "normalized_pos": x,
+            })
+            
+            current_lap, lap_time_string = self.backend.get_laps()
 
-        def write(name, data):
-            with h5py.File(setup.set_laps_dir(name) / f"lap_{timestamp}.h5", "w") as f:
-                f.create_dataset(name, data=np.array(data, dtype=np.float32))
-                f.create_dataset("time", data=np.array(self.x_time, dtype=np.float32))
+            if current_lap > self.last_lap:
+                print(f"Lap {current_lap} completed")
+                
+                
+                try:
+                    self.save(lap_time_string)
+                    print(f"Successfully saved Lap {current_lap} ({lap_time_string})")
+                except Exception as e:
+                    print(f"CRITICAL ERROR SAVING LAP: {e}")
+                
+                self.last_lap = current_lap
+                
+               
+                self.y_gas = []
+                self.y_brake = []
+                self.y_steering = []
+                self.x_dist = []
+                
 
-        write("gas", self.y_gas)
-        write("brake", self.y_brake)
-        write("steering", self.y_steering)
+        
+                
 
+    def save(self, lap_time_string):
+        def write(data, UUID):
+           
+            filepath = setup.set_laps_dir("default") / f"lap_{UUID}.h5"
+            with h5py.File(filepath, "w") as f:
+                f.create_dataset("telemtry", data=data, compression="gzip", compression_opts=4)
+                
+        unique_uuid = str(uuid.uuid4())
+        formatted_samples = [
+            (s["gas"], s["brake"], s["steering"], s["normalized_pos"]) 
+            for s in self.samples
+        ]
+        data = np.array(formatted_samples, dtype=[
+        ("gas", "f4"),
+        ("brake", "f4"),
+        ("steering", "f4"),
+        ("normalized_pos", "f4"),
+        ], )
+        write(data, unique_uuid)
         
         self.backend.db.execute('''
             INSERT INTO laps (UUID, lap_time, car, track, tel_path, date_time)
             VALUES (?, ?, ?, ?, ?, ?)''',
-            (str(uuid.uuid4()), str(self.x_time[-1]), self.backend.get_car(), self.backend.get_track(),
+            (unique_uuid, lap_time_string, self.backend.get_car(), self.backend.get_track(),
              str(setup.set_laps_dir("default")), datetime.datetime.now().strftime('%Y-%m-%d_%H-%M')))
         self.backend.conn.commit()
 
@@ -291,4 +353,36 @@ def main():
     handler = HandleTraces(backend, hz=100)
     handler.loop()
 
-main()
+
+backend = Backend()
+@app.get("/laps")
+def get_track():
+    backend.db.execute("SELECT * FROM laps ORDER BY date_time DESC")
+    rows = backend.db.fetchmany(10)
+    return [{"uuid":r[0],"lap_time":r[1],"car":r[2],"track":r[3],"tel_path":r[4],"date_time":r[5],"favorite":bool(r[6])} for r in rows]
+    
+@app.get("/laps/{uuid}/telemetry")
+def get_gas(uuid: str) -> dict[str, list]: 
+    filepath = setup.set_laps_dir("default") / f"lap_{uuid}.h5"
+    
+    if not filepath.exists():
+        raise HTTPException(status_code=404, detail="Telemetry file not found")
+
+    
+    with h5py.File(filepath, "r") as f:
+       
+        if "telemtry" not in f:
+            raise HTTPException(status_code=404, detail="Dataset not found in file")
+            
+        data = f["telemtry"][:]
+        clean_gas = np.round(np.nan_to_num(data["gas"], nan=0.0, posinf=0.0, neginf=0.0), decimals=2).tolist()
+        clean_brake = np.round(np.nan_to_num(data["brake"], nan=0.0, posinf=0.0, neginf=0.0), decimals=2).tolist()
+        clean_steering = np.round(np.nan_to_num(data["steering"], nan=0.0, posinf=0.0, neginf=0.0), decimals=2).tolist()
+        clean_pos = np.round(np.nan_to_num(data["normalized_pos"], nan=0.0, posinf=0.0, neginf=0.0), decimals=2).tolist()
+
+        return {
+            "gas": clean_gas,
+            "brake": clean_brake,
+            "steering": clean_steering,
+            "normalized_pos": clean_pos
+        }
